@@ -14,7 +14,7 @@ Console.InputEncoding = Encoding.UTF8;
 var configuration = new ConfigurationBuilder()
     .AddUserSecrets<Program>()
     .Build();
-
+//https://console.groq.com/keys  grok api key olusturmak icin adres
 var apiKey = configuration["Groq:ApiKey"];
 
 if (string.IsNullOrWhiteSpace(apiKey))
