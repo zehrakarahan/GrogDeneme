@@ -14,9 +14,8 @@ Console.InputEncoding = Encoding.UTF8;
 var configuration = new ConfigurationBuilder()
     .AddUserSecrets<Program>()
     .Build();
-//https://console.groq.com/keys  grok api key olusturmak icin adres
-var apiKey = configuration["Groq:ApiKey"];
 
+var apiKey = configuration["Groq:ApiKey"];
 if (string.IsNullOrWhiteSpace(apiKey))
 {
     Console.WriteLine("Groq:ApiKey ayarı bulunamadı.");
@@ -73,11 +72,13 @@ var tools = JsonNode.Parse("""
     "type": "function",
     "function": {
       "name": "read_file",
-      "description": "Proje köküne göre verilen kod dosyasını okur.",
+      "description": "Kod dosyasını satır aralığıyla okur. Varsayılan 80 satır. Devamı için start_line kullan.",
       "parameters": {
         "type": "object",
         "properties": {
-          "path": { "type": "string" }
+          "path": { "type": "string" },
+          "start_line": { "type": "integer", "minimum": 1 },
+          "line_count": { "type": "integer", "minimum": 1, "maximum": 120 }
         },
         "required": ["path"],
         "additionalProperties": false
@@ -103,6 +104,44 @@ var tools = JsonNode.Parse("""
 ]
 """)!;
 
+((JsonArray)tools).Add(JsonNode.Parse("""
+{
+  "type": "function",
+  "function": {
+    "name": "search_file",
+    "description": "Proje içindeki bir kod dosyasında metin arar ve satır numaralarıyla eşleşmeleri döndürür.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "Proje köküne göre dosya yolu." },
+        "query": { "type": "string", "minLength": 1 },
+        "max_results": { "type": "integer", "minimum": 1, "maximum": 50 }
+      },
+      "required": ["path", "query"],
+      "additionalProperties": false
+    }
+  }
+}
+"""));
+((JsonArray)tools).Add(JsonNode.Parse("""
+{
+  "type": "function",
+  "function": {
+    "name": "search_project",
+    "description": "Proje genelinde dosya yollarında veya dosya içeriğinde büyük/küçük harf duyarsız düz metin arar. Dosya yolu bilinmiyorsa önce bunu kullan. Sonuçlar sınırlıdır.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "minLength": 1 },
+        "mode": { "type": "string", "enum": ["path", "content"], "description": "path: dosya yolunda, content: dosya içeriğinde arar. Varsayılan content." },
+        "max_results": { "type": "integer", "minimum": 1, "maximum": 30 }
+      },
+      "required": ["query"],
+      "additionalProperties": false
+    }
+  }
+}
+"""));
 var messages = new JsonArray
 {
     new JsonObject
@@ -110,7 +149,9 @@ var messages = new JsonArray
         ["role"] = "system",
         ["content"] = """
         Sen bir C# kod düzenleme asistanısın. Türkçe yanıt ver.
-        İşlem yapmadan önce list_files ile dosyaları keşfet.
+        İlgili dosya bilinmiyorsa önce search_project ile dosya yolunda veya içerikte ara. Tüm dosyaları gereksiz yere listeleme.
+        Yalnızca tools listesinde tanımlı araçları kullan. Dosyada metin aramak için search_file kullan.
+        Araç dosya yollarını seçilen proje köküne göre göreli ver.
         Mevcut dosyaları değiştirmeden önce read_file ile oku.
         İstenen değişiklikleri write_file aracını kullanarak uygula.
         write_file için dosyanın tamamını gönder, kısaltma kullanma.
@@ -118,12 +159,14 @@ var messages = new JsonArray
         Araç başarı bildirmeden dosyanın değiştirildiğini söyleme.
         Derleme ve çalıştırma aracın yok; test edildiğini iddia etme.
         Gizli bilgi veya API anahtarı isteme ve dosyalara ekleme.
+        Aynı aramayı tekrar etme. Eşleşmelerin satırlarını read_file start_line ve line_count ile incele.
+        Eski araç sonuçları kısaltılabilir. Eksik içeriği uydurma; gerekiyorsa yeniden oku.
         """
     }
 };
 
 Console.WriteLine($"\nHedef: {workspace}");
-Console.WriteLine("İsteğini yaz. Çıkış: /exit");
+Console.WriteLine("İsteğini yaz. Çıkış: /exit | Geçmişi temizle: /clear");
 
 while (true)
 {
@@ -137,6 +180,13 @@ while (true)
     if (string.IsNullOrWhiteSpace(question))
         continue;
 
+    if (question.Trim().Equals("/clear", StringComparison.OrdinalIgnoreCase))
+    {
+        while (messages.Count > 1)
+            messages.RemoveAt(messages.Count - 1);
+        Console.WriteLine("Konuşma geçmişi temizlendi. Dosyalar değişmedi.");
+        continue;
+    }
     // Hatalı veya yarım kalan turu geçmişten kaldırabilmek için.
     var turnStart = messages.Count;
 
@@ -150,28 +200,19 @@ while (true)
     {
         var completed = false;
 
-        for (var step = 0; step < 12; step++)
+        for (var step = 0; step < 60; step++)
         {
             var request = new JsonObject
             {
                 ["model"] = "openai/gpt-oss-20b",
-                ["messages"] = messages.DeepClone(),
+                ["messages"] = BuildContext(),
                 ["tools"] = tools.DeepClone(),
                 ["tool_choice"] = "auto",
-                ["max_completion_tokens"] = 8192,
+                ["max_completion_tokens"] = 2048,
                 ["stream"] = false
             };
 
-            using var response = await http.PostAsJsonAsync(
-                "chat/completions", request);
-
-            var json = await response.Content.ReadAsStringAsync();
-
-            if (!response.IsSuccessStatusCode)
-            {
-                throw new HttpRequestException(
-                    $"API hatası ({(int)response.StatusCode}): {json}");
-            }
+            var json = await SendWithRetryAsync(request);
 
             var result = JsonNode.Parse(json)
                 ?? throw new Exception("API yanıtı boş.");
@@ -254,6 +295,128 @@ while (true)
     }
 }
 
+JsonArray BuildContext()
+{
+    var context = (JsonArray)messages.DeepClone();
+    // Önce eski, tamamlanmış kullanıcı turlarını kaldır.
+    while (context.Count > 2 && context.ToJsonString().Length > 14000)
+    {
+        var nextUser = -1;
+        for (var i = 2; i < context.Count; i++)
+            if (context[i]?["role"]?.GetValue<string>() == "user")
+            {
+                nextUser = i;
+                break;
+            }
+        if (nextUser < 0) break;
+        for (var i = 1; i < nextUser; i++) context.RemoveAt(1);
+    }
+    // Araç kimliklerini koru, eski sonuçların metnini açıkça kısalt.
+    var toolIndexes = Enumerable.Range(0, context.Count)
+        .Where(i => context[i]?["role"]?.GetValue<string>() == "tool").ToArray();
+    foreach (var index in toolIndexes.Take(Math.Max(0, toolIndexes.Length - 2)))
+    {
+        var content = context[index]?["content"]?.GetValue<string>();
+        if (content?.Length > 400)
+            context[index]!["content"] = content[..400] + " [Eski sonuç kısaltıldı; gerekirse yeniden oku.]";
+    }
+    // En eski araç turunu çağrısı ve TÜM sonuçlarıyla birlikte çıkar.
+    while (context.ToJsonString().Length > 18000)
+    {
+        var removed = false;
+        for (var i = 1; i < context.Count - 1; i++)
+        {
+            if (context[i]?["tool_calls"] is not JsonArray) continue;
+            var end = i + 1;
+            while (end < context.Count && context[end]?["role"]?.GetValue<string>() == "tool") end++;
+            if (end == context.Count) continue; // Son araç turunu koru.
+            var count = end - i;
+            for (var j = 0; j < count; j++) context.RemoveAt(i);
+            removed = true;
+            break;
+        }
+        if (!removed) break;
+    }
+    return context;
+}
+async Task<string> SendWithRetryAsync(JsonObject request)
+{
+    const int maxAttempts = 12;
+
+    for (var attempt = 0; attempt < maxAttempts; attempt++)
+    {
+        using var response = await http.PostAsJsonAsync("chat/completions", request);
+        var json = await response.Content.ReadAsStringAsync();
+
+        if (response.IsSuccessStatusCode)
+            return json;
+
+        if (response.StatusCode != System.Net.HttpStatusCode.TooManyRequests)
+        {
+            if (response.StatusCode == System.Net.HttpStatusCode.BadRequest &&
+                json.Contains("output_parse_failed", StringComparison.Ordinal) && attempt < 2)
+            {
+                Console.WriteLine("[Model yanıtı okunamadı; otomatik tekrar deneniyor.]");
+                await Task.Delay(TimeSpan.FromSeconds(2));
+                continue;
+            }
+            throw new HttpRequestException($"API hatası ({(int)response.StatusCode}): {json}");
+        }
+
+        string errorMessage;
+        try
+        {
+            errorMessage = JsonNode.Parse(json)?["error"]?["message"]?.GetValue<string>() ?? json;
+        }
+        catch (JsonException)
+        {
+            errorMessage = json;
+        }
+
+        // Tek isteğin kendisi kotadan büyükse beklemek sorunu çözmez.
+        var sizes = System.Text.RegularExpressions.Regex.Match(
+            errorMessage, @"Limit\s+(\d+).*?Requested\s+(\d+)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        if (sizes.Success &&
+            long.TryParse(sizes.Groups[1].Value, out var tokenLimit) &&
+            long.TryParse(sizes.Groups[2].Value, out var requestedTokens) &&
+            requestedTokens > tokenLimit)
+        {
+            throw new Exception(
+                "Tek istek token kotasını aşıyor. /clear ile geçmişi temizleyip daha küçük bir dosya veya görev seç. " + errorMessage);
+        }
+
+        if (attempt == maxAttempts - 1)
+            throw new Exception("Kota beklemesine rağmen istek tamamlanamadı. Daha sonra tekrar dene. " + errorMessage);
+
+        var wait = response.Headers.RetryAfter?.Delta;
+        if (wait is null && response.Headers.RetryAfter?.Date is { } retryDate)
+            wait = retryDate - DateTimeOffset.UtcNow;
+
+        if (wait is null)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(
+                errorMessage, @"try again in\s+([0-9.]+)s",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            if (match.Success && double.TryParse(match.Groups[1].Value,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var seconds))
+                wait = TimeSpan.FromSeconds(seconds);
+        }
+
+        wait ??= TimeSpan.FromSeconds(Math.Pow(2, attempt + 1));
+        if (wait.Value > TimeSpan.FromMinutes(10))
+            throw new Exception("Kota için uzun bekleme gerekiyor. Daha sonra tekrar dene. " + errorMessage);
+
+        var delay = TimeSpan.FromSeconds(Math.Max(1, wait.Value.TotalSeconds) + 1);
+        Console.WriteLine($"[Kota doldu: {delay.TotalSeconds:F1} saniye bekleniyor. Deneme {attempt + 2}/{maxAttempts}]");
+        await Task.Delay(delay);
+    }
+
+    throw new InvalidOperationException("İstek tamamlanamadı.");
+}
 string ExecuteTool(string name, string arguments)
 {
     using var document = JsonDocument.Parse(arguments);
@@ -262,13 +425,106 @@ string ExecuteTool(string name, string arguments)
     if (name == "list_files")
     {
         var files = ListFiles(workspace)
-            .Take(300)
+            .Take(60)
             .ToArray();
 
         return JsonSerializer.Serialize(files);
     }
 
-    if (name != "read_file" && name != "write_file")
+    if (name == "search_project")
+    {
+        var query = args.GetProperty("query").GetString();
+        if (string.IsNullOrWhiteSpace(query) || query.Length > 200)
+            throw new Exception("Arama metni 1-200 karakter olmalı.");
+
+        var mode = args.TryGetProperty("mode", out var modeValue)
+            ? modeValue.GetString() : "content";
+        if (mode != "path" && mode != "content")
+            throw new Exception("mode path veya content olmalı.");
+
+        var maxResults = 5;
+        if (args.TryGetProperty("max_results", out var limit))
+        {
+            if (!limit.TryGetInt32(out maxResults))
+                throw new Exception("max_results tam sayı olmalı.");
+            maxResults = Math.Clamp(maxResults, 1, 10);
+        }
+
+        var matches = new List<object>();
+        var filesScanned = 0;
+        var skippedFiles = 0;
+        var truncated = false;
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+
+        foreach (var relative in ListFiles(workspace))
+        {
+            if (filesScanned >= 30000 || timer.Elapsed > TimeSpan.FromSeconds(60))
+            {
+                truncated = true;
+                break;
+            }
+
+            filesScanned++;
+            try
+            {
+                var filePath = ResolvePath(relative);
+                if (mode == "path")
+                {
+                    if (!relative.Replace((char)92, (char)47).Contains(
+                        query.Replace((char)92, (char)47), StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    matches.Add(new { path = relative });
+                }
+                else
+                {
+                    if (new FileInfo(filePath).Length > 2_000_000)
+                    {
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    var lineNumber = 0;
+                    foreach (var line in File.ReadLines(filePath))
+                    {
+                        lineNumber++;
+                        if (timer.Elapsed > TimeSpan.FromSeconds(60))
+                        {
+                            truncated = true;
+                            break;
+                        }
+                        if (!line.Contains(query, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        matches.Add(new
+                        {
+                            path = relative,
+                            line = lineNumber,
+                            text = line.Length > 300 ? line[..300] : line
+                        });
+                        if (matches.Count > maxResults)
+                            break;
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                skippedFiles++;
+            }
+
+            if (matches.Count > maxResults || truncated)
+            {
+                truncated = true;
+                break;
+            }
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            query, mode, filesScanned, skippedFiles, truncated,
+            matches = matches.Take(maxResults)
+        });
+    }
+    if (name != "read_file" && name != "write_file" && name != "search_file")
         throw new Exception("İzin verilmeyen araç.");
 
     var relativePath = args.GetProperty("path").GetString()
@@ -276,18 +532,78 @@ string ExecuteTool(string name, string arguments)
 
     var fullPath = ResolvePath(relativePath);
 
+    if (name == "search_file")
+    {
+        var query = args.GetProperty("query").GetString();
+        if (string.IsNullOrWhiteSpace(query))
+            throw new Exception("Aranacak metin boş olamaz.");
+
+        if (!File.Exists(fullPath))
+            throw new Exception("Dosya bulunamadı.");
+
+        if (new FileInfo(fullPath).Length > 2_000_000)
+            throw new Exception("Dosya arama için çok büyük.");
+
+        var maxResults = 5;
+        if (args.TryGetProperty("max_results", out var limit))
+        {
+            if (!limit.TryGetInt32(out maxResults))
+                throw new Exception("max_results tam sayı olmalı.");
+            maxResults = Math.Clamp(maxResults, 1, 10);
+        }
+
+        var matches = File.ReadLines(fullPath)
+            .Select((text, index) => new { line = index + 1, text })
+            .Where(item => item.text.Contains(query, StringComparison.OrdinalIgnoreCase))
+            .Take(maxResults + 1)
+            .ToArray();
+
+        return JsonSerializer.Serialize(new
+        {
+            path = relativePath,
+            query,
+            truncated = matches.Length > maxResults,
+            matches = matches.Take(maxResults).Select(item => new
+            {
+                item.line,
+                text = item.text.Length > 500 ? item.text[..500] : item.text
+            })
+        });
+    }
     if (name == "read_file")
     {
         if (!File.Exists(fullPath))
             throw new Exception("Dosya bulunamadı.");
 
-        if (new FileInfo(fullPath).Length > 60_000)
-            throw new Exception("Dosya bu demo için çok büyük.");
-
+        var startLine = args.TryGetProperty("start_line", out var startValue)
+            ? startValue.GetInt32() : 1;
+        var lineCount = args.TryGetProperty("line_count", out var countValue)
+            ? countValue.GetInt32() : 80;
+        if (startLine < 1 || lineCount < 1)
+            throw new Exception("Satır değerleri pozitif olmalı.");
+        lineCount = Math.Min(lineCount, 120);
+        if (new FileInfo(fullPath).Length > 2_000_000)
+            throw new Exception("Dosya okuma için çok büyük.");
+        var lines = File.ReadLines(fullPath).Skip(startLine - 1).Take(lineCount + 1).ToArray();
+        var selected = new List<object>();
+        var characters = 0;
+        var consumed = 0;
+        foreach (var line in lines.Take(lineCount))
+        {
+            if (characters + line.Length > 6000)
+                break;
+            selected.Add(new { line = startLine + consumed, text = line });
+            characters += line.Length;
+            consumed++;
+        }
+        if (consumed == 0 && lines.Length > 0)
+            throw new Exception("Tek satır çok uzun; search_file ile hedef metni ara.");
         return JsonSerializer.Serialize(new
         {
-            path = relativePath,
-            content = File.ReadAllText(fullPath)
+            path = relativePath, startLine,
+            next_start_line = startLine + consumed,
+            has_more = lines.Length > consumed,
+            lines = selected
         });
     }
 
